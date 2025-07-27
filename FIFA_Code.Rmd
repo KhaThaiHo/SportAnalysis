@@ -1,0 +1,2456 @@
+---
+title: "Xử lý số liệu thống kê - FIFA Data"
+author: "Nhóm 8"
+output:
+  
+  word_document: default
+  html_document: default
+date: "2025-1-10"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Thông tin nhóm
+
+1. Kha Thái Hồ            - 22280025 - Leader
+
+2. Nguyễn Văn Trung Chính - 22280007 - Member
+
+3. Trần Chí Hữu           - 22280038 - Member
+
+4. Huỳnh Ngọc Hòa         - 22280026 - Member
+
+5. Lê Phan Ngọc Hiếu      - 22280023 - Member
+
+# I.Cài đặt thư viện và tải dữ liệu
+```{r, results='hide', include=FALSE}
+library(tidyverse)
+library(VIM)
+library(janitor)
+library(mice)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(lmPerm)
+library(skimr)
+library(car)
+library(ISLR2)
+library(leaps)
+library(caret)
+
+```
+
+```{r}
+# Đọc dữ liệu
+fifa_data <- read_csv('Dataset/fifa_eda_stats.csv')
+```
+
+
+# II.Tiền xử lý dữ liệu
+
+## 1.Làm sạch tên biến
+
+Dùng lệnh clean_names() để đưa tên biến về định dạng phù hợp
+
+```{r}
+cleaned_data <- fifa_data |> clean_names()
+```
+
+## 2.Tổng quan dữ liệu
+
+Xem xét tổng quan dữ liệu bằng lệnh skim
+
+```{r}
+skim(cleaned_data)
+```
+
+**Nhận xét**:
+
+- Dữ liệu có 18207 bản ghi, 57 biến bao gồm 15 biến
+phân loại và 42 biến dạng số.
+
+- Trong số các biến phân loại, biến bị khuyết nhiều nhất là biến loaned_from với 16943 dữ liệu khuyết.
+
+- Trong số các biến dạng số, cũng tồn tại các giá trị khuyết.
+
+- Trung bình của chỉ số Overall là 71.31 với sai số chuẩn 6.14 (Trên thang điểm 100). Trung bình của international_reputation là 1.11 với sd là 0.39 (Trên thang điểm 5)
+
+## 3.Kiểm tra bản ghi trùng lặp
+```{r}
+nrow(fifa_data[duplicated(fifa_data), ])
+```
+**Nhận xét**: Không có bản ghi trùng lặp trong dữ liệu.
+
+## 4.Xử lý cho từng biến cụ thể:
+
+### 4.1 Xử lý các giá trị tiền tệ:
+
+Ta kiểm tra thấy các giá trị tiền tệ (Wage, value) chứa các ký tự không hợp lệ
+
+```{r, echo=FALSE}
+print(head(cleaned_data[, c("wage", "value")], 5))
+```
+
+=> Ta sẽ chỉnh sửa các giá trị này (Đơn vị: triệu Euro)
+
+```{r, warning=FALSE}
+cleaned_data <- cleaned_data |> 
+  mutate(across(c(value, wage, release_clause), ~ {
+    # Loại bỏ ký tự '€'
+    no_currency <- gsub('€', '', .)
+    # Xử lý các giá trị với đơn vị 'M' và 'K'
+    ifelse(grepl('M', no_currency), 
+           as.numeric(gsub('M', '', no_currency)) , 
+           ifelse(grepl('K', no_currency), 
+                  as.numeric(gsub('K', '', no_currency)) * 1e-3, 
+                  as.numeric(no_currency)))
+  }))
+print(head(cleaned_data[, c("wage", "value")], 5))
+```
+
+### 4.2 Chiều cao và cân nặng:
+
+Chiều cao đang ở đơn vị inch và cân nặng đơn vị lbs,
+
+
+```{r, echo=FALSE}
+print(head(cleaned_data[, c("height", "weight")], 5))
+```
+
+=> Ta sẽ đưa về đơn vị cm và kg để phù hợp hơn.
+
+```{r}
+clean_height <- function(height_value) {
+  height_split <- regmatches(height_value, gregexpr("\\d+", height_value))
+  feet <- as.numeric(sapply(height_split, '[', 1))
+  inches <- as.numeric(sapply(height_split, '[', 2))
+  feet * 0.3048 + inches * 0.0254
+}
+cleaned_data <- cleaned_data |> mutate(height = clean_height(height))
+cleaned_data <- cleaned_data |> mutate(weight = as.numeric(gsub('lbs', '', weight)) * 0.453592)
+print(head(cleaned_data[, c("height", "weight")], 5))
+```
+
+### 4.3 Biến work_rate:
+
+Ta nhận thấy biến work_rate là biến phân loại đang chứa 2 thông tin
+
+```{r, echo=FALSE}
+print(head(cleaned_data$work_rate,5))
+```
+
+=> Ta sẽ tách ra thành attack và defense và encode theo cấp bậc tương ứng.
+
+```{r, echo=FALSE}
+cleaned_data <- cleaned_data |> 
+  separate(work_rate, into = c('work_rate_attack', 'work_rate_defense'), sep = '/', fill = "right", extra = "drop") |> 
+  mutate(across(c(work_rate_attack, work_rate_defense), 
+                ~ case_when(
+                    trimws(.) == "High" ~ 3,
+                    trimws(.) == "Medium" ~ 2,
+                    trimws(.) == "Low" ~ 1,
+                    TRUE ~ NA_real_
+                  )))
+print(head(cleaned_data[, c("work_rate_attack", "work_rate_defense")], 5))
+```
+
+### 4.4 Biến body_type:
+
+Ta số hóa các giá trị dạng type
+
+```{r}
+levels_body_type = levels(factor(cleaned_data$body_type))
+cleaned_data <- cleaned_data |> 
+  mutate(body_type = as.numeric(as.factor(body_type)))
+print(head(cleaned_data$body_type,5))
+```
+
+
+### 4.5 Biến loaned_from
+
+Biến loaned_from chứa quá nhiều giá trị rỗng (>80%) và không có cách khôi phục được
+
+
+```{r}
+print(sum(is.na(cleaned_data$loaned_from))/nrow(cleaned_data))
+```
+
+
+=> Ta sẽ loại bỏ biến này
+```{r}
+cleaned_data <- cleaned_data |> select(-loaned_from)
+```
+
+### 4.6 Biến preferred_foot:
+
+Do các dòng bị thiếu ở cột preferred_foot cũng thiếu trên hầu như các biến khác (47/57) do đó
+nếu dự đoán và điền các giá trị bị thiếu từ các biến còn lại sẽ không chính xác
+Mà dữ liệu bị khuyết < 5% nên cách giải quyết là loại bỏ các dòng mà preferred_foot bị khuyết
+
+
+```{r}
+cleaned_data <- cleaned_data |> filter(!is.na(preferred_foot))
+```
+
+### 4.7 Biến joined:
+
+Biến joined chứa các thông tin về ngày, tháng, năm các cầu thủ gia nhập câu lạc bộ, ta sẽ tiến hành tách theo từng đơn vị thời gian
+
+```{r, echo=FALSE}
+print(head(cleaned_data$joined,5))
+```
+
+```{r}
+cleaned_data <- cleaned_data |> 
+  mutate(joined = as.Date(joined, format = '%b %d, %Y')) |> 
+  mutate(joined_year = year(joined), 
+         joined_month = month(joined), 
+         joined_day = day(joined)) |> 
+  select(-joined)
+print(head(cleaned_data[, c("joined_day", "joined_month","joined_year")], 5))
+```
+
+
+## 5.Xử lý dữ liệu khuyết:
+
+### 5.1 Biểu đồ % tỉ lệ khuyết của dữ liệu:
+
+```{r, echo=FALSE}
+missing_cols <- cleaned_data[, colSums(is.na(cleaned_data)) > 0]
+aggr(missing_cols, ylab=c('Proportion of missings', 'Pattern'), cex.axis=0.5, cex.numbes=0.5)
+```
+
+### 5.2 Điền các giá trị khuyết
+
+Ta điền các giá trị khuyết cho biến câu lạc bộ (club) và biến release_clause
+
+- club: Chuyển các giá trị khuyết thành Unknown (Có thể hiểu là chưa có hoặc chưa biết câu lạc bộ)
+
+- release_clause: CHuyển giá trị khuyết thành Unknown và chuyển đổi thành 0 
+```{r}
+cleaned_data <- cleaned_data |> 
+  mutate(across(everything(), ~ ifelse(is.na(club) & is.na(.), 'Unknown', .))) |> 
+  mutate(release_clause = as.numeric(ifelse(release_clause == 'Unknown', 0, release_clause)))
+```
+
+
+### 5.3 Điền giá trị khuyết bằng multiple imputation
+
+Cuối cùng, điền các giá trị khuyết còn lại bằng Multiple Imputation
+
+```{r, results='hide'}
+imp_data <- mice(cleaned_data, 20, 'pmm', printFlag = TRUE)
+final_data <- complete(imp_data, 5)
+```
+
+## 6.Outliers Remover:
+
+Bằng một vài phương pháp như Histogram hay dùng bảng tóm tắt, ta có thể thấy biến wage và value bị lệch quá lớn vì có nhiều giá trị quá
+
+cao, để phù hợp cho tính toán thống kê, ta sẽ dùng IQR để lọc các giá trị này đi.
+
+Số dòng dữ liệu trước khi xử lý:
+
+```{r, echo=FALSE}
+nrow(final_data)
+```
+
+
+```{r}
+final_data <- final_data |> filter(final_data$value > 0)
+final_data <- final_data |> filter(final_data$wage > 0)
+
+iqr_wage <- IQR(final_data$wage, na.rm = TRUE)
+q1 <- quantile(final_data$wage, 0.25, na.rm = TRUE)
+q3 <- quantile(final_data$wage, 0.75, na.rm = TRUE)
+
+# Xác định ngưỡng
+lower_bound <- q1 - 1.5 * iqr_wage
+upper_bound <- q3 + 1.5 * iqr_wage
+
+# Loại bỏ outliers
+final_data <- final_data |>
+  filter(wage >= lower_bound & wage <= upper_bound)
+
+iqr_value <- IQR(final_data$value, na.rm = TRUE)
+q1 <- quantile(final_data$value, 0.25, na.rm = TRUE)
+q3 <- quantile(final_data$value, 0.75, na.rm = TRUE)
+
+# Xác định ngưỡng
+lower_bound <- q1 - 1.5 * iqr_value
+upper_bound <- q3 + 1.5 * iqr_value
+
+# Loại bỏ outliers
+final_data <-final_data |>
+  filter(value >= lower_bound & value <= upper_bound)
+```
+
+Dữ liệu còn lại khi xử lý Outliers:
+
+```{r, echo=FALSE}
+nrow(final_data)
+```
+
+## 7.Loại bỏ các Feature không cần thiết:
+
+Một số biến không đóng góp nhiều cho dữ liệu hoặc khong cần thiết như: 
+
+```{r}
+final_data <- final_data |> select(-c(joined_year, joined_month,joined_day))
+```
+
+
+# III. Khám phá dữ liệu
+
+## 1.Bảng tóm tắt
+
+```{r}
+
+sum_data <- final_data |> 
+  clean_names(case = 'lower_camel')
+
+# Tạo bảng tóm tắt cho đặc điểm cơ thể
+summary_table <- sum_data |>
+  summarise(across(c("age", "value", "releaseClause", "wage", "overall", "potential", "height", "weight","skillMoves"),
+                   list(Min = min, Max = max, Median = median,
+                      Mean = mean, SD = sd)))
+
+summary_table <- summary_table |> 
+  gather(ten, gt) |>
+  separate(ten, into = c("bien", "tk"), sep = "_") |>
+  spread(tk, gt) |>
+  select(bien, Min, Max, Median, Mean, SD)
+summary_table
+```
+
+## 2.Biểu đồ phân phối
+
+Ta dùng biểu đồ Histogram để trực quan hóa phân phối một số biến
+
+```{r, echo=FALSE}
+data_long <- final_data |> 
+  select(age, value, wage, height, weight, overall, potential, skill_moves) |> 
+  pivot_longer(cols = everything(), names_to = "variable", values_to = "value")
+
+ggplot(data_long, aes(x = value)) +
+  geom_histogram(bins = 10, fill = "skyblue", color = "black", alpha = 0.7) +
+  facet_wrap(~ variable, scales = "free", ncol = 2) +
+  labs(title = "Phân phối các biến", x = "Giá trị", y = "Tần suất") +
+  theme_minimal()
+```
+
+**Nhận xét**: Các dữ liệu đã gần như hội tụ về phân phối chuẩn
+
+# IV. Kiểm định giả thuyết
+
+Ta sẽ thực hiện một vài kiểm định giả thuyết để xem xét mối liên hệ giữa một vài thuộc tính
+
+```{r, echo=FALSE}
+# Hàm Permutation Test
+perm_fun <- function(x ,nA,nB,R){
+  n <- nA + nB
+  mean_diff <- numeric(R)
+  for (i in 1:R){
+    idx_a <- sample(x = 1:n, size = nA)
+    idx_b <- setdiff(x = 1:n, y = idx_a)
+    mean_diff[i] <- mean(x[idx_a]) - mean(x[idx_b])
+  }
+  return(mean_diff)
+}
+```
+
+
+## 1.Chân thuận có ảnh hưởng đến mức lương ?
+
+Ta xét giả thuyết và đối thuyết:
+
+$H_0$: $u_L$ = $u_R$ (Trung bình mức lương của cầu thủ sử dụng chân trái và phải như nhau)
+                          
+$H_1$: $u_L$ > $u_R$ (Trung bình mức lương của cầu thủ sử dụng chân trái tốt hơn chân phải)
+
+### 1.1 Bảng tóm tắt dữ liệu:
+
+```{r, echo=FALSE}
+final_data|>
+  group_by(preferred_foot)|>
+  summarise(n = n(), mean = mean(wage), sd = sd(wage))
+```
+
+**Nhận xét**: Nếu chỉ dựa vào bảng số liệu, ta có thể thấy trung bình lương của cầu thủ thuận chân trái cao hơn chân phải
+
+### 1.2 A/B Testing:
+
+Ta thực hiện A/B Testing kết hợp Permutation Test
+
+```{r, echo=FALSE}
+set.seed(1)
+diff_mean_perm_wage <- perm_fun(final_data$wage, nA = 3153, nB = 10670, R = 1000)
+mean_left_wage <- mean(final_data$wage[final_data$preferred_foot == "Left"])
+mean_right_wage <- mean(final_data$wage[final_data$preferred_foot == "Right"])
+p_value_wage <- mean(diff_mean_perm_wage > mean_left_wage - mean_right_wage)
+```
+
+#### 1.2.1 Biểu đồ chênh lệch 
+```{r, echo=FALSE}
+ggplot(final_data, aes(x = preferred_foot, y = wage, fill = preferred_foot))+
+  geom_violin()+
+  geom_boxplot(width = 0.5)+
+  scale_fill_manual(breaks = c("Left", "Right"),
+                    values = c("forestgreen", "skyblue"))+
+  labs(x = "Preferred Foot", y = "WAGE")+
+  theme_bw()+
+  theme(legend.position = "none")
+```
+
+
+#### 1.2.2 Biểu đồ phân phối Histogram
+```{r, echo=FALSE}
+ggplot(data = tibble(perm_diffs = diff_mean_perm_wage), aes(x = perm_diffs)) +
+  geom_histogram(bins = 10, fill = "gray80", color = "black") +
+  labs(x = "Wage Different", y = "Frequency") +
+  theme_bw()
+```
+
+#### 1.2.3 p-value
+```{r}
+p_value_wage
+```
+
+**Nhận xét**: Với mức ý nghĩa $alpha$ = 0.05, $p_{value}$ < alpha => Cầu thủ thuận chân trái có mức lương tốt hơn thuận chân phải
+
+
+## 2.Chân thuận có ảnh hưởng đến khả năng kiểm soát bóng ?
+
+Ta xét giả thuyết và đối thuyết:
+
+$H_0$: $u_L$ = $u_R$ (Khả năng kiểm soát bóng của cầu thủ sử dụng chân trái và phải như nhau)
+                          
+$H_1$: $u_L$ > $u_R$ (Khả năng kiểm soát bóng của cầu thủ sử dụng chân trái tốt hơn chân phải)
+
+### 2.1 Bảng tóm tắt dữ liệu:
+
+```{r, echo=FALSE}
+final_data|>
+  group_by(preferred_foot)|>
+  summarise(n = n(), mean = mean(ball_control), sd = sd(ball_control))
+```
+
+**Nhận xét**: Nếu chỉ dựa vào bảng số liệu, ta có thể thấy trung bình khả năng kiểm soát bóng của cầu thủ thuận chân trái cao hơn chân phải
+
+### 2.2 A/B Testing:
+
+Ta thực hiện A/B Testing kết hợp Permutation Test
+
+```{r, echo=FALSE}
+set.seed(1)
+diff_mean_perm_bc <- perm_fun(final_data$ball_control, nA = 3153, nB = 10670, R = 1000)
+mean_left_bc <- mean(final_data$ball_control[final_data$preferred_foot == "Left"])
+mean_right_bc <- mean(final_data$ball_control[final_data$preferred_foot == "Right"])
+p_value_bc <- mean(diff_mean_perm_bc > mean_left_bc - mean_right_bc)
+```
+
+#### 2.2.1 Biểu đồ chênh lệch 
+```{r, echo=FALSE}
+ggplot(final_data, aes(x = preferred_foot, y = ball_control, fill = preferred_foot))+
+  geom_violin()+
+  geom_boxplot(width = 0.5)+
+  scale_fill_manual(breaks = c("Left", "Right"),
+                    values = c("forestgreen", "skyblue"))+
+  labs(x = "Preferred Foot", y = "BALL CONTROLL")+
+  theme_bw()+
+  theme(legend.position = "none")
+```
+
+#### 2.2.2 Biểu đồ phân phối Histogram
+```{r, echo=FALSE}
+ggplot(data = tibble(perm_diffs = diff_mean_perm_bc), aes(x = perm_diffs)) +
+  geom_histogram(bins = 10, fill = "gray80", color = "black") +
+  labs(x = "Ball Control Different", y = "Frequency") +
+  theme_bw()
+```
+
+#### 2.2.3 p-value
+```{r}
+p_value_bc
+```
+
+**Nhận xét**: Với mức ý nghĩa $alpha$ = 0.05, $p_{value}$ < alpha => Cầu thủ thuận chân trái kiểm soát bóng tốt hơn thuận chân phải
+
+## 3.Chân thuận có ảnh hưởng đến lực sút hay không ?
+
+Ta xét giả thuyết và đối thuyết:
+
+$H_0$: $u_L$ = $u_R$ (Lực sút của cầu thủ sử dụng chân trái và phải như nhau)
+                          
+$H_1$: $u_L$ > $u_R$ (Lực sút của cầu thủ sử dụng chân trái tốt hơn chân phải)
+
+### 3.1 Bảng tóm tắt dữ liệu:
+
+```{r, echo=FALSE}
+final_data|>
+  group_by(preferred_foot)|>
+  summarise(n = n(), mean = mean(shot_power), sd = sd(shot_power))
+```
+
+**Nhận xét**: Nếu chỉ dựa vào bảng số liệu, ta có thể thấy trung bình lực sút của cầu thủ thuận chân trái cao hơn chân phải
+
+### 3.2 A/B Testing:
+
+Ta thực hiện A/B Testing kết hợp Permutation Test
+
+```{r, echo=FALSE}
+set.seed(1)
+diff_mean_perm_shot_power <- perm_fun(final_data$shot_power, nA = 3153 ,nB = 10670, R=1000)
+mean_left_shot_power <- mean(final_data$shot_power[final_data$preferred_foot == "Left"])
+mean_right_shot_power <- mean(final_data$shot_power[final_data$preferred_foot == "Right"])
+p_value_shot <- mean(diff_mean_perm_shot_power > mean_left_shot_power - mean_right_shot_power)
+```
+
+#### 3.2.1 Biểu đồ chênh lệch 
+```{r, echo=FALSE}
+ggplot(final_data, aes(x = preferred_foot, y = shot_power, fill = preferred_foot))+
+  geom_violin()+
+  geom_boxplot(width = 0.5)+
+  scale_fill_manual(breaks = c("Left", "Right"),
+                    values = c("forestgreen", "skyblue"))+
+  labs(x = "Preferred Foot", y = "SHOT POWER")+
+  theme_bw()+
+  theme(legend.position = "none")
+```
+
+#### 3.2.2 Biểu đồ phân phối Histogram
+
+```{r,echo=FALSE}
+ggplot(data = tibble(perm_diffs = diff_mean_perm_shot_power), aes(x = perm_diffs)) +
+  geom_histogram(bins = 10, fill = "gray80", color = "black") +
+  labs(x = "Shot Power Different", y = "Frequency") +
+  theme_bw()
+```
+
+
+#### 3.2.3 p-value
+```{r}
+p_value_shot
+```
+
+**Nhận xét**: Với mức ý nghĩa $alpha$ = 0.05, $p_{value}$ < alpha => Cầu thủ chân trái có lực sút hơn chân phải
+
+## 4.Vị trí của cầu thủ có ảnh hưởng đến mức lương hay không ?
+
+Ta xét giả thuyết và đối thuyết:
+
+$H_0$: $u_{ThuMon}$ = $u_{TienDao}$ = $u_{TienVe}$ = $u_{HauVe}$ (Lương giữa các vị trí là như nhau)
+                          
+$H_1$: $u_{ThuMon}$ $\neq$ $u_{TienDao}$ $\neq$ $u_{TienVe}$ $\neq$ $u_{HauVe}$ (Lương giữa các vị trí là khác nhau)
+
+### 4.1 Kiểm tra và gom nhóm các vị trí
+
+Ta sẽ kiểm tra xem có bao nhiêu vị trí cụ thể:
+
+```{r, echo=FALSE}
+pos_wage_data <- final_data|>
+  filter(final_data$wage > 0)|>
+  select(wage , position) 
+
+position <- pos_wage_data|> 
+  distinct(position)
+
+position
+```
+
+Sau đó, ta sẽ gom nhóm theo 4 nhóm chính: Tiền đạo, Tiền vệ, Hậu vệ, Thủ môn
+
+```{r}
+# Nhóm vị trí
+Tiendao <- c("RF", "ST", "LW", "LF", "RS", "LS", "RW", "CF")
+Tienve <- c("RCM", "LDM", "CAM", "CDM", "RM", "LAM", "RDM", "CM", "RAM","LM","LCM")
+Hauve <- c("RCB", "CB", "LCB", "LB", "RB", "RWB", "LWB")
+Thumon <- c("GK")
+
+pos_wage_data <- pos_wage_data |> 
+  mutate(
+    position_group = case_when(
+      position %in% Tiendao ~ "Striker",
+      position %in% Tienve ~ "Midfield",
+      position %in% Hauve ~ "Defender",
+      position %in% Thumon ~ "GoalKeeper",
+      TRUE ~ "None" # Nếu không thuộc nhóm nào
+    )
+  )
+```
+
+
+### 4.2 Bảng tóm tắt dữ liệu:
+
+```{r, echo=FALSE}
+pos_wage_data|>
+  group_by(position_group)|>
+  summarise(n = n(), mean = mean(wage), sd = sd(wage))
+```
+
+**Nhận xét**: Nếu chỉ dựa vào bảng số liệu, ta có thể thấy trung bình lương của Tiền đạo là cao nhất, sau đó đến lần lượt là Hậu vệ
+, Tiền vệ và cuối cùng là Thủ môn.
+
+### 4.3 A/B Testing:
+
+Ta thực hiện A/B Testing kết hợp Permutation Test
+
+#### 4.3.1 Biểu đồ chênh lệch 
+```{r, echo=FALSE}
+ggplot(pos_wage_data, aes(x = position_group, y = wage, fill = position_group)) +
+  geom_violin() +
+  geom_boxplot(width = 0.15) +
+  labs(x = "POSTION", y = "WAGE") +
+  theme_bw() +
+  theme(legend.position = "none")
+```
+
+
+#### 4.3.2 p-value
+```{r}
+out_aov_3 <- aovp(formula = wage ~ position_group, data = pos_wage_data, perm = "Prob")
+summary(out_aov_3)
+```
+
+**Nhận xét**: Với mức ý nghĩa $alpha$ = 0.05, $p_{value}$ < alpha => Các vị trí khác nhau sẽ có mức lương trung bình khác nhau.
+
+## 5.Độ tuổi của cầu thủ có ảnh hưởng đến chỉ số tổng thể hay không ?
+
+Ta xét giả thuyết và đối thuyết:
+
+$H_0$: $u_{1}$ = $u_{2}$ = $u_{3}$ = $u_{4}$ (Trung bình tổng thể giữa các độ tuổi là như nhau)
+                          
+$H_1$: $u_{1}$ $\neq$ $u_{2}$ $\neq$ $u_{3}$ $\neq$ $u_{4}$ (Trung bình tổng thể giữa các độ tuổi là khác nhau)
+
+### 5.1 Kiểm tra và gom nhóm độ tuổi
+
+Ta sẽ chia thành 4 độ tuổi dựa trên mức phân vị của dữ liệu.
+
+```{r, echo=FALSE}
+overall_age <- final_data |>
+  select(overall, age)
+  
+min_age <- min(overall_age$age)
+age_q1 <- quantile(overall_age$age , 0.25)
+age_q2 <- quantile(overall_age$age , 0.5)
+age_q3 <- quantile(overall_age$age , 0.75)
+max_age <- max(overall_age$age)
+
+print(c(min_age,age_q1,age_q2,age_q3,max_age))
+# chia thành 4 nhóm
+
+# Chia độ tuổi thành 4 đoạn (quartiles)
+overall_age <- overall_age %>%
+  mutate(age_group = case_when(
+    age <= age_q1 ~ "[16 ,21]",
+    age <= age_q2 ~ "(21, 24]",
+    age <= age_q3 ~ "(25, 28]",
+    TRUE ~ "(28, 45]"
+  ))
+
+```
+
+### 5.2 Bảng tóm tắt dữ liệu:
+
+```{r, echo=FALSE}
+overall_age|>
+  group_by(age_group)|>
+  summarise(n = n(), mean = mean(overall), sd = sd(overall))
+```
+
+**Nhận xét**: Nếu chỉ dựa vào bảng số liệu, ta có thể thấy trung bình chỉ số tổng thể của độ tuổi 28 - 45 là cao nhất, sau đó đến lần lượt là 25 - 28, 21 - 24 và cuối cùng là 16 - 21.
+
+### 5.3 A/B Testing:
+
+Ta thực hiện A/B Testing kết hợp Permutation Test
+
+#### 5.3.1 Biểu đồ chênh lệch 
+```{r, echo=FALSE}
+ggplot(overall_age, aes(x = age_group, y = overall, fill = age_group)) +
+  geom_violin() +
+  geom_boxplot(width = 0.15) +
+  labs(x = "AGE_SEGMENT", y = "OVERALL") +
+  theme_bw() +
+  theme(legend.position = "none")
+```
+
+
+#### 5.3.2 p-value
+```{r}
+out_aov_2 <- aovp(formula = overall ~ age_group, data = overall_age, perm = "Prob")
+
+summary(out_aov_2)
+```
+
+**Nhận xét**: Với mức ý nghĩa $alpha$ = 0.05, $p_{value}$ < alpha => Các độ tuổi khác nhau sẽ có chỉ số tổng thể khác nhau.
+
+
+# V. Mô hình hồi quy tuyến tính
+
+## 1. Feature Engineering:
+
+### 1.1 Biến Nationality:
+
+Biến Nationality đang ở dạng phân loại, ta sẽ đưa biến về dạng số
+
+
+```{r, echo=FALSE}
+print('Nationality trước khi biến đổi: ')
+head(final_data$nationality, 5)
+```
+
+```{r,echo=FALSE}
+levels_nationality = levels(factor(final_data$nationality))
+final_data <- final_data |>
+  mutate(nationality = as.numeric(as.factor(nationality)))
+print('Nationality sau khi biến đổi: ')
+head(final_data$nationality, 5)
+```
+
+
+### 1.2 Biến club:
+
+Biến Club đang ở dạng phân loại, ta sẽ đưa biến về dạng số
+
+```{r, echo=FALSE}
+print('Club trước khi biến đổi: ')
+head(final_data$club, 5)
+```
+
+```{r,echo=FALSE}
+levels_club = levels(factor(final_data$club))
+final_data <- final_data |> 
+  mutate(club = as.numeric(as.factor(club)))
+print('Club sau khi biến đổi: ')
+head(final_data$club, 5)
+```
+
+### 1.3 Biến prefered_foot:
+
+Biến prefered_foot đang ở dạng phân loại, ta sẽ đưa biến về dạng số
+
+```{r, echo=FALSE}
+print('Chân thuận trước khi biến đổi: ')
+head(final_data$preferred_foot, 5)
+```
+
+```{r,echo=FALSE}
+final_data <- final_data |> 
+  mutate(preferred_foot = case_when(
+    preferred_foot == "Left" ~ 0,
+    preferred_foot == "Right" ~ 1,
+    TRUE ~ NA_real_  # Gán NA cho các giá trị không khớp
+  ))
+print('Chân thuận sau khi biến đổi: ')
+head(final_data$preferred_foot, 5)
+```
+
+### 1.4 Gom nhóm các vị trí:
+
+Ta nhận thấy rằng, một vị trí khác nhau trên sân sẽ có những biến đáp ứng phù hợp khác nhau, nên ta sẽ gom nhóm và thực hiện mô hình theo từng vị trí.
+
+```{r}
+Tiendao <- c("RF", "ST", "LW", "LF", "RS", "LS", "RW", "CF")
+Tienve <- c("RCM", "LDM", "CAM", "CDM", "RM", "LAM", "RDM", "CM", "RAM","LM","LCM")
+Hauve <- c("RCB", "CB", "LCB", "LB", "RB", "RWB", "LWB")
+Thumon <- c("GK")
+
+final_data <- final_data |> 
+  mutate(
+    position_group = case_when(
+      position %in% Tiendao ~ "Striker",
+      position %in% Tienve ~ "Midfield",
+      position %in% Hauve ~ "Defender",
+      position %in% Thumon ~ "GoalKeeper",
+      TRUE ~ "None" # Nếu không thuộc nhóm nào
+    )
+  )
+
+df<-final_data 
+```
+
+
+## 2. Mô hình hồi quy cho tổng thể (Overall):
+
+### 2.1 Thực hiện mô hình
+
+Ta chỉ dùng các biến chỉ số (stats) của cầu thủ để dự đoán cho mô hình hồi quy dự đoán chỉ số Overall
+
+```{r}
+overall_feature <- names(df)
+# Lấy tất cả các cột từ chỉ số của cầu thủ để hồi quy overall
+overall_feature <- overall_feature[22:55]
+overall_feature
+overall_formula <- as.formula(paste("overall ~", paste(overall_feature, collapse = "+")))
+
+# Chạy mô hình hồi quy tuyến tính với các biến đã chọn
+overall_model <- lm(overall_formula, data = df)
+
+# In kết quả của mô hình
+summary(overall_model)
+```
+**Nhận xét**: Dựa vào kết quả của mô hình ta có thể đúc kết một vài **Nhận xét**
+
+- Các biến reactions, ball_controll, composure lần lượt là 4 chỉ số có trọng số cao (> 0.1) trong việc quyết định Overall.
+
+- Các biến volleys, aggression, interceptions, fk_accuracy, pennalties là các biến không ảnh hưởng đáng kể đến mô hình (p-value > 0.1).
+
+- $R_2$ Score ~ 0.7725 cho thấy mô hình có ý nghĩa giải thích ở mức khá.
+
+### 2.2 Biểu đồ giá trị thực tế và dự đoán
+
+```{r, echo=FALSE}
+# Dự đoán với mô hình mới
+predict_overall <- predict(overall_model, newdata = df)
+
+# Vẽ biểu đồ dự đoán so với giá trị thực tế
+result <- data.frame(actual_values = df$overall, predictions = predict_overall)
+
+ggplot(result, aes(x = actual_values, y = predictions)) +
+  geom_point(color = "red") +
+  geom_abline(slope = 1, intercept = 0, color = "blue") +
+  labs(
+    title = "Actual vs Predicted Values",
+    x = "Actual Values",
+    y = "Predicted Values"
+  ) +
+  theme_minimal()
+```
+
+**Nhận xét**: Đường hồi quy của mô hình di chuyển khá khớp với các điểm dữ liệu
+
+### 2.3 Một số chuẩn đoán cho mô hình
+
+#### 2.3.1 Kiểm định tuyến tính mô hình
+
+```{r, echo=FALSE}
+ggplot(data = overall_model, mapping = aes(x = .fitted, y = .resid)) +
+  geom_point() +
+  geom_smooth(method = "loess", se = FALSE) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(title = "Residuals vs Fitted",
+       x = "Fitted values", 
+       y = "Residuals") +
+  theme_bw()
+```
+
+**Nhận xét**: Hình vẽ không cho thấy xu hướng một đường cong đáng kể
+
+=> Giả định về tuyến tính của mô hình là phù hợp
+
+#### 2.3.2 Kiểm tra tính đồng nhất phương sai
+
+```{r, echo=FALSE}
+ggplot(data = overall_model, mapping = aes(x = .fitted, y = sqrt(abs(.stdresid)))) +
+  geom_point(na.rm = TRUE) +
+  geom_smooth(method = "loess", se = FALSE, na.rm = TRUE) +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  labs(x = "Fitted Values", y = expression(sqrt("|Standardized residuals|"))) +
+  theme_bw()
+```
+
+**Nhận xét**: Đường thẳng không xấp xỉ 1
+
+=> Phương sai không đồng nhất
+
+#### 2.3.3 Kiểm tra đa cộng tuyến
+
+```{r}
+vif(overall_model)
+```
+
+**Nhận xét**: Ta thấy mô hình xảy ra đa cộng tuyến ở nhiều biến, ta sẽ xử lý và khởi tạo lại mô hình
+
+
+Ta sẽ loại bỏ biến có VIF cao nhất sau đó tính lại VIF của toàn bộ mô hình cho đến khi VIF của tất cả các biến đều < 10
+
+```{r}
+vif_values <- vif(overall_model)
+while (max(vif_values) > 10) {
+  high_vif_var <- names(which.max(vif_values))  # Tìm biến có VIF cao nhất
+  # cat("Loại bỏ biến:", high_vif_var, "với VIF =", max(vif_values), "\n")
+  
+  # Loại bỏ biến có VIF cao nhất khỏi danh sách biến
+  overall_feature <- overall_feature[!overall_feature %in% high_vif_var]
+  
+  # Cập nhật công thức hồi quy
+  overall_formula <- as.formula(paste("overall ~", paste(overall_feature, collapse = "+")))
+  
+  # Chạy lại mô hình hồi quy
+  overall_model <- lm(overall_formula, data = df)
+  
+  # Tính lại VIF
+  vif_values <- vif(overall_model)
+}
+```
+
+Ta có danh sách các biến sau khi xử lý
+
+```{r, echo=FALSE}
+print(overall_feature)
+```
+
+Khởi tạo lại mô hình
+
+```{r}
+summary(overall_model)
+```
+
+**Nhận xét**:
+
+- Mô hình cho ra R2-Score khá cao, chứng tỏ mô hình giải thích tốt cho biến mục tiêu
+
+- Các biến có mối quan hệ tuyến tính.
+
+##### Biểu đồ đường thẳng hồi quy
+
+```{r, echo=FALSE}
+# Dự đoán với mô hình mới
+predict_overall <- predict(overall_model, newdata = df)
+
+# Vẽ biểu đồ dự đoán so với giá trị thực tế
+result <- data.frame(actual_values = df$overall, predictions = predict_overall)
+
+ggplot(result, aes(x = actual_values, y = predictions)) +
+  geom_point(color = "red") +
+  geom_abline(slope = 1, intercept = 0, color = "blue") +
+  labs(
+    title = "Actual vs Predicted Values",
+    x = "Actual Values",
+    y = "Predicted Values"
+  ) +
+  theme_minimal()
+```
+
+**Nhận xét**: Các điểm dữ liệu phân bố khá khớp với đường thẳng hồi quy
+
+##### Kiểm định tuyến tính cho mô hình mới
+
+```{r, echo=FALSE}
+ggplot(data = overall_model, mapping = aes(x = .fitted, y = .resid)) +
+  geom_point() +
+  geom_smooth(method = "loess", se = FALSE) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(title = "Residuals vs Fitted",
+       x = "Fitted values", 
+       y = "Residuals") +
+  theme_bw()
+```
+
+**Nhận xét**: Đồ thị không cho thấy 1 xu hướng cong cụ thể
+
+=> Giả định về mối liên hệ tuyến tính giữa các biến là phù hợp.
+
+##### Kiểm định đồng nhất phương sai cho mô hình mới
+
+```{r, echo=FALSE}
+ggplot(data = overall_model, mapping = aes(x = .fitted, y = sqrt(abs(.stdresid)))) +
+  geom_point(na.rm = TRUE) +
+  geom_smooth(method = "loess", se = FALSE, na.rm = TRUE) +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  labs(x = "Fitted Values", y = expression(sqrt("|Standardized residuals|"))) +
+  theme_bw()
+```
+
+**Nhận xét**: Đồ thị chưa khớp lắm với đường thẳng 1
+
+=> Giả định về đồng nhất phương sai là chưa phù hợp.
+
+#### Đánh giá mô hình
+##### RMSE của mô hình
+
+```{r}
+set.seed(5)  # Để tái tạo kết quả
+
+# Chia dữ liệu thành tập huấn luyện và kiểm tra
+train_index <- sample(seq_len(nrow(df)), size = 0.8 * nrow(df))  # 80% cho huấn luyện
+train_data <- df[train_index, ]
+test_data <- df[-train_index, ]
+
+# Tạo mô hình hồi quy với các biến độc lập
+overall_formula <- as.formula(paste("overall ~", paste(names(df)[22:55], collapse = "+")))
+md_overall <- lm(overall_formula, data = train_data)
+
+# Dự đoán trên tập kiểm tra
+predictions <- predict(md_overall, newdata = test_data)
+
+# Tính toán RMSE
+actual_values <- test_data$overall
+rmse <- sqrt(mean((actual_values - predictions)^2))
+print(paste("RMSE từ tập kiểm tra: ", rmse))
+```
+
+
+#### R2 Score
+
+```{r}
+actual_values <- df$overall
+predicted_values <- predict_overall
+ss_res <- sum((actual_values - predicted_values)^2)
+ss_tot <- sum((actual_values - mean(actual_values))^2)
+r2 <- 1 - (ss_res / ss_tot)
+print(paste("R2 Score của mô hình là:", r2))
+```
+
+#### Áp dụng k-fold validation để tính RMSE
+
+```{r}
+set.seed(123)  # Để tái tạo kết quả
+# áp dụng K-Fold Cross-Validation
+k_fold_cv <- function(data, model_formula, k) {
+  set.seed(123)  # Đảm bảo kết quả có thể tái tạo
+  folds <- cut(seq(1, nrow(data)), breaks = k, labels = FALSE)  # Chia thành k nhóm
+  errors <- numeric(k)  # Lưu trữ RMSE từng fold
+  
+  for (i in 1:k) {
+    # Tách training và test set
+    test_indices <- which(folds == i, arr.ind = TRUE)
+    test_data <- data[test_indices, ]
+    train_data <- data[-test_indices, ]
+    
+    # Huấn luyện mô hình
+    model <- lm(model_formula, data = train_data)
+    
+    # Dự đoán
+    predictions <- predict(model, newdata = test_data)
+    
+    # Tính RMSE của fold
+    errors[i] <- sqrt(mean((test_data$overall - predictions)^2))
+  }
+  
+  # Tính RMSE trung bình
+  mean_rmse <- mean(errors)
+  return(mean_rmse)
+}
+
+# Áp dụng K-Fold CV với k = 5
+k <- 5
+k_fold_result <- k_fold_cv(df, overall_formula, k)
+
+```
+
+```{r, echo=FALSE}
+# In kết quả
+print(paste("RMSE từ K-Fold CV (k =", k, "):", k_fold_result))
+```
+
+## 3. Mô hình hồi quy cho từng vị trí
+### Phân chia dữ liệu:
+
+Tách dữ liệu theo từng vị trí:
+
+```{r}
+df_gk_numeric<-df[df$position_group == "GoalKeeper", ]
+df_st_numeric <- df[df$position_group == "Striker", ]
+df_mid_numeric <- df[df$position_group == "Midfield", ]
+df_df_numeric <- df[df$position_group == "Defender", ]
+```
+
+Các vị trí như Tiền đạo, hậu vệ, tiền vệ sẽ không cần các chỉ số của Thủ môn, nên ta sẽ loại bỏ các biến này
+
+```{r}
+df_st_numeric <- df_st_numeric |> select(-c(gk_diving, gk_handling, gk_kicking, gk_positioning, gk_reflexes))
+df_mid_numeric <- df_mid_numeric |> select(-c(gk_diving, gk_handling, gk_kicking, gk_positioning, gk_reflexes))
+df_df_numeric <- df_df_numeric |> select(-c(gk_diving, gk_handling, gk_kicking, gk_positioning, gk_reflexes))
+```
+
+### 3.1 Mô hình hồi quy cho Goal Keeper:
+
+#### 3.1.1 Lựa chọn biến phù hợp với mô hình
+
+```{r}
+df_gk_numeric <- df_gk_numeric |> select_if(is.numeric)
+# Tìm các biến phụ thuộc tuyến tính
+lin_combos <- findLinearCombos(df_gk_numeric)
+# Loại bỏ các biến phụ thuộc tuyến tính (nếu có)
+if (!is.null(lin_combos$remove)) {
+  df_gk_cleaned <- df_gk_numeric[, -lin_combos$remove]
+} else {
+  df_gk_cleaned <- df_gk_numeric
+}
+
+# Loại bỏ các biến không có ý nghĩa 
+df_gk_numeric <- df_gk_cleaned |> select(-c(id,nationality,club))
+```
+
+Dùng Stepwise để lựa chọn các biến phù hợp
+
+```{r, results='hide'}
+# Chạy stepwise để giảm số lượng biến
+md_full <- lm(wage ~ ., data = df_gk_numeric)
+step_md <- step(md_full, direction = "both")
+
+# Lấy danh sách biến từ stepwise
+selected_vars <- names(coef(step_md))[-1]
+# Giới hạn dữ liệu chỉ chứa các biến đã chọn
+df_gk_numeric <- df_gk_numeric[, c("wage", selected_vars)]
+```
+Các biến lựa chọn là
+
+```{r, echo=FALSE}
+print(selected_vars)
+```
+
+
+#### 3.1.2 Biểu đồ RMSE theo các biến đã chọn
+
+```{r, echo=FALSE, warning=FALSE}
+# thực hiện regsubsets để lấy tập biến con với RMSE nhỏ nhất
+gk_rmse_values <- c()
+gk_best_nvmax <- 0
+gk_min_rmse <- Inf  # Khởi tạo giá trị RMSE thấp nhất là vô cùng lớn
+gk_best_vars <- c()
+
+n_col <- ncol(df_gk_numeric) - 1
+
+# Lặp qua các giá trị nvmax từ 1 đến số lượng biến tối đa
+for (i in 1:n_col) {
+  # Thực hiện regsubsets với nvmax = i
+  gk_best_subset <- regsubsets(wage ~ ., data = df_gk_numeric, nvmax = i)
+  
+  # Lấy thông tin tóm tắt từ regsubsets
+  gk_best_subset_summary <- summary(gk_best_subset)
+  
+  # Tính toán giá trị dự đoán và RMSE cho tập con tốt nhất với i biến
+  gk_selected_vars <- names(coef(gk_best_subset, id = i))[-1]
+  gk_formula <- as.formula(paste("wage ~", paste(gk_selected_vars, collapse = "+")))
+  
+  # Chạy mô hình hồi quy tuyến tính
+  gk_model <- lm(gk_formula, data = df_gk_numeric)
+  
+  # Tính toán RMSE
+  gk_predictions <- predict(gk_model, newdata = df_gk_numeric)
+  gk_rmse <- sqrt(mean((df_gk_numeric$wage - gk_predictions)^2))
+  
+  # Lưu lại RMSE
+  gk_rmse_values <- c(gk_rmse_values, gk_rmse)
+  
+  # Kiểm tra nếu RMSE hiện tại nhỏ hơn RMSE nhỏ nhất
+  if (gk_rmse < gk_min_rmse) {
+    gk_min_rmse <- gk_rmse
+    gk_best_nvmax <- i
+    gk_best_vars <- gk_selected_vars  # Lưu lại các biến tương ứng với RMSE nhỏ nhất
+  }
+}
+
+# Tạo bảng dữ liệu cho ggplot
+gk_rmse_data <- data.frame(
+  nvmax = 1:n_col,
+  RMSE = gk_rmse_values
+)
+
+# Vẽ biểu đồ RMSE
+ggplot(gk_rmse_data, aes(x = nvmax, y = RMSE)) +
+  geom_line(color = "blue", size = 1) +
+  geom_point(color = "red", size = 2) +
+  labs(
+    x = "Number of Variables (nvmax)",
+    y = "RMSE",
+    title = "RMSE vs Number of Variables"
+  ) +
+  theme_minimal()
+
+```
+
+**Nhận xét**: Vậy, các biến trên là các biến phù hợp
+
+#### 3.1.3 Áp dụng mô hình cho các biến đã chọn
+
+```{r, echo=FALSE}
+gk_formula_final <- as.formula(paste("wage ~", paste(gk_best_vars, collapse = "+")))
+
+# Chạy mô hình hồi quy tuyến tính với các biến đã chọn
+gk_model_final <- lm(gk_formula_final, data = df_gk_numeric)
+
+# In kết quả của mô hình
+summary(gk_model_final)
+```
+
+**Nhận xét**:
+
+- Mô hình Có $R_2$ Score = 0.5059, mô hình dữ đoán tương đối mức lương của thủ môn.
+
+- Các biến quan trọng ảnh hưởng đến wage của 1 thủ môn: age, value, inter_reputa, release_clause.
+
+- Một số biến không quan trọng: sprint_speed, fk_accuracy, positioning.
+
+#### 3.1.4 Biểu đồ hồi quy
+
+```{r}
+gk_predict_wage <- predict(gk_model_final, newdata = df_gk_numeric)
+
+# Vẽ biểu đồ dự đoán so với giá trị thực tế
+result <- data.frame(actual_values = df_gk_numeric$wage, predictions = gk_predict_wage)
+
+ggplot(result, aes(x = actual_values, y = predictions)) +
+  geom_point(color = "red") +
+  geom_abline(slope = 1, intercept = 0, color = "blue") +
+  labs(
+    title = "Actual vs Predicted Values",
+    x = "Actual Values",
+    y = "Predicted Values"
+  ) +
+  theme_minimal()
+```
+
+**Nhận xét**: Đường thẳng hồi quy biểu diễn tương đối với các điểm dữ liệu
+
+#### 3.1.5 Một số chuẩn đoán cho mô hình
+
+##### Kiểm định tuyến tính mô hình
+
+```{r, echo=FALSE}
+ggplot(data = gk_model_final, mapping = aes(x = .fitted, y = .resid)) +
+  geom_point() +
+  geom_smooth(method = "loess", se = FALSE) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(title = "Residuals vs Fitted",
+       x = "Fitted values", 
+       y = "Residuals") +
+  theme_bw()
+```
+
+**Nhận xét**: Hình vẽ không cho thấy xu hướng đường cong cụ thể
+
+=> Giả định về tuyến tính của mô hình là phù hợp
+
+##### Kiểm định đồng nhất phương sai
+
+```{r, echo=FALSE}
+ggplot(data = gk_model_final, mapping = aes(x = .fitted, y = sqrt(abs(.stdresid)))) +
+  geom_point(na.rm = TRUE) +
+  geom_smooth(method = "loess", se = FALSE, na.rm = TRUE) +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  labs(x = "Fitted Values", y = expression(sqrt("|Standardized residuals|"))) +
+  theme_bw()
+```
+
+**Nhận xét**: Đồ thị xấp xỉ đường thẳng 1
+
+=> Giả định về phương sai đồng nhất là hợp lý
+
+##### Kiểm tra đa cộng tuyến
+
+```{r}
+vif(gk_model_final)
+```
+
+**Nhận xét**: Mô hình xảy ra đa cộng tuyến ở biến overall.
+
+Ta tiến hành loại bỏ biến overall và kiểm tra lại
+```{r, echo=FALSE}
+gk_best_vars <- gk_best_vars[-which(gk_best_vars == "overall")]
+gk_formula_final <- as.formula(paste("wage ~", paste(gk_best_vars, collapse = "+")))
+
+# Chạy mô hình hồi quy tuyến tính với các biến đã chọn
+gk_model_final <- lm(gk_formula_final, data = df_gk_numeric)
+
+# In kết quả của mô hình
+vif(gk_model_final)
+```
+
+**Nhận xét**: Mô hình đã không còn đa cộng tuyến
+
+#### 3.1.6 Đánh giá mô hình
+##### RMSE của mô hình
+
+```{r}
+set.seed(5)  # Để tái tạo kết quả
+
+# Chia dữ liệu thành tập huấn luyện và kiểm tra (80% huấn luyện, 20% kiểm tra)
+train_index <- sample(seq_len(nrow(df_gk_numeric)), size = 0.8 * nrow(df_gk_numeric))
+train_data <- df_gk_numeric[train_index, ]
+test_data <- df_gk_numeric[-train_index, ]
+
+# Tạo công thức mô hình với các biến đã chọn
+gk_formula_final <- as.formula(paste("wage ~", paste(gk_best_vars, collapse = "+")))
+
+# Huấn luyện mô hình hồi quy tuyến tính
+gk_model_final <- lm(gk_formula_final, data = train_data)
+
+# Dự đoán trên tập kiểm tra
+gk_predictions <- predict(gk_model_final, newdata = test_data)
+
+actual_values <- test_data$wage
+rmse <- sqrt(mean((actual_values - gk_predictions)^2))
+print(paste("RMSE từ tập kiểm tra: ", rmse))
+```
+
+
+#### R2 Score
+
+```{r}
+actual_values <- df_gk_numeric$wage
+predicted_values <- gk_predict_wage
+ss_res <- sum((actual_values - predicted_values)^2)
+ss_tot <- sum((actual_values - mean(actual_values))^2)
+r2 <- 1 - (ss_res / ss_tot)
+print(paste("R2 Score của mô hình là:", r2))
+```
+
+#### Áp dụng k-fold validation để tính RMSE
+
+```{r}
+#sử dụng K-Fold Cross-Validation
+k_fold_cv <- function(data, model_formula, k) {
+  set.seed(123)  # Đảm bảo kết quả có thể tái tạo
+  folds <- cut(seq(1, nrow(data)), breaks = k, labels = FALSE)  # Chia thành k nhóm
+  errors <- numeric(k)  # Lưu trữ RMSE từng fold
+  
+  for (i in 1:k) {
+    # Tách training và test set
+    test_indices <- which(folds == i, arr.ind = TRUE)
+    test_data <- data[test_indices, ]
+    train_data <- data[-test_indices, ]
+    
+    # Huấn luyện mô hình trên training set
+    model <- lm(model_formula, data = train_data)
+    
+    # Dự đoán trên test set
+    predictions <- predict(model, newdata = test_data)
+    
+    # Tính RMSE của fold
+    errors[i] <- sqrt(mean((test_data$wage - predictions)^2))
+  }
+  
+  # Tính RMSE trung bình của tất cả các folds
+  mean_rmse <- mean(errors)
+  return(mean_rmse)
+}
+
+# Áp dụng K-Fold CV với k = 5
+k <- 5
+k_fold_result <- k_fold_cv(df_gk_numeric, gk_formula_final, k)
+
+```
+
+```{r, echo=FALSE}
+# In kết quả
+print(paste("RMSE từ K-Fold CV (k =", k, "):", k_fold_result))
+```
+
+#### 3.1.7 Mở rộng mô hình
+
+##### Khởi tạo mô hình
+Ta sẽ tiến hành chạy mô hình bậc 2 với các biến có ít độ tuyến tính với mô hình
+
+```{r}
+coeffs <- summary(gk_model_final)$coefficients
+
+if (is.matrix(coeffs)) {
+  p_values <- coeffs[, "Pr(>|t|)"]
+} else {
+  # Khi chỉ có một biến độc lập
+  p_values <- coeffs["Pr(>|t|)"]
+}
+
+# Loại bỏ hệ số intercept (nếu cần)
+p_values <- p_values[-1]  # Loại bỏ dòng đầu tiên (Intercept)
+
+# Phân loại biến theo p-value
+gk_2 <- names(p_values[p_values > 0.05])  # Biến có p-value > 0.05
+gk_1 <- names(p_values[p_values <= 0.05]) # Biến có p-value <= 0.05
+
+gk_best_vars_1 <- gk_best_vars[gk_best_vars %in% gk_1] 
+gk_best_vars_2 <- gk_best_vars[gk_best_vars %in% gk_2]
+gk_formula_final <- as.formula(paste("wage ~", 
+                                     paste(gk_best_vars_1, collapse = "+"), 
+                                     "+", 
+                                     paste(paste0("I(", gk_best_vars_2, "^2)"), collapse = "+")))
+
+# Chạy mô hình hồi quy tuyến tính bậc hai
+gk_model_final <- lm(gk_formula_final, data = df_gk_numeric)
+```
+
+```{r}
+# In kết quả của mô hình
+summary(gk_model_final)
+```
+Nhận xét: R2 Score tăng lên sau khi áp dụng mô hình bậc 2
+
+##### Đường thẳng hồi quy
+
+```{r, echo=FALSE}
+# Dự đoán với mô hình bậc hai
+gk_predict_wage <- predict(gk_model_final, newdata = df_gk_numeric)
+
+# Vẽ biểu đồ dự đoán so với giá trị thực tế
+result <- data.frame(actual_values = df_gk_numeric$wage, predictions = gk_predict_wage)
+
+ggplot(result, aes(x = actual_values, y = predictions)) +
+  geom_point(color = "red") +
+  geom_abline(slope = 1, intercept = 0, color = "blue") +
+  labs(
+    title = "Actual vs Predicted Values (Quadratic Model)",
+    x = "Actual Values",
+    y = "Predicted Values"
+  ) +
+  theme_minimal()
+```
+
+
+##### Đánh giá mô hình
+
+```{r, echo=FALSE}
+set.seed(5)  # Để tái tạo kết quả
+
+# Chia dữ liệu thành tập huấn luyện và kiểm tra (80% huấn luyện, 20% kiểm tra)
+train_index <- sample(seq_len(nrow(df_gk_numeric)), size = 0.8 * nrow(df_gk_numeric))
+train_data <- df_gk_numeric[train_index, ]
+test_data <- df_gk_numeric[-train_index, ]
+
+# Tạo công thức mô hình bậc hai
+gk_formula_final <- as.formula(paste("wage ~", 
+                                     paste(gk_best_vars, collapse = "+"), 
+                                     "+", 
+                                     paste(paste0("I(", gk_best_vars, "^2)"), collapse = "+")))
+
+# Huấn luyện mô hình bậc hai
+gk_model_final <- lm(gk_formula_final, data = train_data)
+
+# Dự đoán trên tập kiểm tra
+gk_predictions <- predict(gk_model_final, newdata = test_data)
+
+# Tính toán RMSE trên tập kiểm tra
+actual_values <- test_data$wage
+rmse <- sqrt(mean((actual_values - gk_predictions)^2))
+print(paste("RMSE từ tập kiểm tra (Quadratic Model):", rmse))
+```
+
+```{r, echo=FALSE}
+actual_values <- df_gk_numeric$wage
+predicted_values <- gk_predict_wage
+ss_res <- sum((actual_values - predicted_values)^2)
+ss_tot <- sum((actual_values - mean(actual_values))^2)
+r2 <- 1 - (ss_res / ss_tot)
+print(paste("R2 Score của mô hình bậc hai là:", r2))
+```
+
+**Nhận xét**: Mô hình bậc 2 có kết quả chạy tốt hơn, với R2 Score cao hơn và RMSE thấp hơn.
+
+### 3.2 Mô hình hồi quy dự đoán mức lương cho vị trí Tiền đạo
+
+#### 3.2.1 Lựa chọn biến phù hợp cho mô hình 
+
+```{r}
+# Tìm các biến phụ thuộc tuyến tính
+df_st_numeric <- df_st_numeric |> select_if(is.numeric)
+lin_combos <- findLinearCombos(df_st_numeric)
+# Loại bỏ các biến phụ thuộc tuyến tính (nếu có)
+if (!is.null(lin_combos$remove)) {
+  df_st_cleaned <- df_st_numeric[, -lin_combos$remove]
+} else {
+  df_st_cleaned <- df_st_numeric
+}
+
+# Loại bỏ các biến không có ý nghĩa 
+df_st_numeric <- df_st_cleaned |> select(-c(id, nationality, club)) 
+```
+
+Dùng Stepwise để lựa chọn các biến phù hợp:
+
+```{r, results='hide'}
+# Chạy stepwise để giảm số lượng biến
+md_full <- lm(wage ~ ., data = df_st_numeric)
+step_md <- step(md_full, direction = "both")
+# Lấy danh sách biến từ stepwise
+selected_vars <- names(coef(step_md))[-1]
+```
+
+Các biến phù hợp để khởi tạo mô hình là:
+
+```{r}
+print(selected_vars)
+```
+
+#### 3.2.2 Biểu đồ RMSE cho các biến đã chọn
+
+```{r, echo=FALSE, warning=FALSE}
+df_st_numeric <- df_st_numeric[, c("wage", selected_vars)]
+
+# thực hiện regsubsets để lấy tập biến con với RMSE nhỏ nhất
+st_rmse_values <- c()
+st_best_nvmax <- 0
+st_min_rmse <- Inf  # Khởi tạo giá trị RMSE thấp nhất là vô cùng lớn
+st_best_vars <- c()
+
+n_col <- ncol(df_st_numeric) - 1
+
+# Lặp qua các giá trị nvmax từ 1 đến số lượng biến tối đa
+for (i in 1:n_col) {
+  # Thực hiện regsubsets với nvmax = i
+  st_best_subset <- regsubsets(wage ~ ., data = df_st_numeric, nvmax = i)
+  
+  # Lấy thông tin tóm tắt từ regsubsets
+  st_best_subset_summary <- summary(st_best_subset)
+  
+  # Tính toán giá trị dự đoán và RMSE cho tập con tốt nhất với i biến
+  st_selected_vars <- names(coef(st_best_subset, id = i))[-1]
+  st_formula <- as.formula(paste("wage ~", paste(st_selected_vars, collapse = "+")))
+  
+  # Chạy mô hình hồi quy tuyến tính
+  st_model <- lm(st_formula, data = df_st_numeric)
+  
+  # Tính toán RMSE
+  st_predictions <- predict(st_model, newdata = df_st_numeric)
+  st_rmse <- sqrt(mean((df_st_numeric$wage - st_predictions)^2))
+  
+  # Lưu lại RMSE
+  st_rmse_values <- c(st_rmse_values, st_rmse)
+  
+  # Kiểm tra nếu RMSE hiện tại nhỏ hơn RMSE nhỏ nhất
+  if (st_rmse < st_min_rmse) {
+    st_min_rmse <- st_rmse
+    st_best_nvmax <- i
+    st_best_vars <- st_selected_vars  # Lưu lại các biến tương ứng với RMSE nhỏ nhất
+  }
+}
+
+# Tạo bảng dữ liệu cho ggplot
+st_rmse_data <- data.frame(
+  nvmax = 1:n_col,
+  RMSE = st_rmse_values
+)
+
+# Vẽ biểu đồ RMSE
+ggplot(st_rmse_data, aes(x = nvmax, y = RMSE)) +
+  geom_line(color = "blue", size = 1) +
+  geom_point(color = "red", size = 2) +
+  labs(
+    x = "Number of Variables (nvmax)",
+    y = "RMSE",
+    title = "RMSE vs Number of Variables"
+  ) +
+  theme_minimal()
+```
+
+**Nhận xét**: Vậy, các biến trên được chọn để khởi tạo mô hình là phù hợp
+
+#### 3.2.3 Áp dụng mô hình cho các biến đã chọn
+
+```{r, echo=FALSE}
+set.seed(1)
+# Tạo công thức hồi quy từ các biến trong st_best_vars
+st_formula_final <- as.formula(paste("wage ~", paste(st_best_vars, collapse = "+")))
+
+# Chạy mô hình hồi quy tuyến tính với các biến đã chọn
+st_model_final <- lm(st_formula_final, data = df_st_numeric)
+
+# In kết quả của mô hình
+summary(st_model_final)
+```
+
+**Nhận xét**:
+
+- R2 Score: mô hình giải thích tương đối cho biến mục tiêu
+
+- Một số biến ảnh hưởng mạnh đến wage của vị trí Tiền đạo: age, value, crossing.
+
+- Một số biến không ảnh hưởng nhiều đến mô hình: body_type, penalties.
+
+#### 3.2.4 Biểu đồ hồi quy
+
+```{r}
+# Dự đoán với mô hình mới
+st_predict_wage <- predict(st_model_final, newdata = df_st_numeric)
+
+# Vẽ biểu đồ dự đoán so với giá trị thực tế
+result <- data.frame(actual_values = df_st_numeric$wage, predictions = st_predict_wage)
+
+ggplot(result, aes(x = actual_values, y = predictions)) +
+  geom_point(color = "red") +
+  geom_abline(slope = 1, intercept = 0, color = "blue") +
+  labs(
+    title = "Actual vs Predicted Values",
+    x = "Actual Values",
+    y = "Predicted Values"
+  ) +
+  theme_minimal()
+```
+
+**Nhận xét**: Đường thẳng hồi quy không quá khớp với dữ liệu.
+
+#### 3.2.5 Một số chuẩn đoán cho mô hình
+
+##### Kiểm định tuyến tính mô hình
+
+```{r, echo=FALSE}
+ggplot(data = st_model_final, mapping = aes(x = .fitted, y = .resid)) +
+  geom_point() +
+  geom_smooth(method = "loess", se = FALSE) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(title = "Residuals vs Fitted",
+       x = "Fitted values", 
+       y = "Residuals") +
+  theme_bw()
+```
+
+**Nhận xét**: Hình vẽ cho thấy xu hướng đường cong
+
+=> Giả định về tuyến tính của mô hình là chưa phù hợp
+
+##### Kiểm đinh đồng nhất phương sai
+
+```{r, echo=FALSE}
+ggplot(data = st_model_final, mapping = aes(x = .fitted, y = sqrt(abs(.stdresid)))) +
+  geom_point(na.rm = TRUE) +
+  geom_smooth(method = "loess", se = FALSE, na.rm = TRUE) +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  labs(x = "Fitted Values", y = expression(sqrt("|Standardized residuals|"))) +
+  theme_bw()
+```
+
+**Nhận xét**: Đồ thị không xấp xỉ đường thẳng 1
+
+=> Giả định về phương sai đồng nhất là chưa hợp lý
+
+##### Kiểm tra đa cộng tuyến
+
+```{r}
+vif(st_model_final)
+```
+
+**Nhận xét**: Mô hình không xảy ra đa cộng tuyến.
+
+#### 3.2.6 Đánh giá mô hình
+##### RMSE của mô hình
+
+```{r}
+set.seed(5)  # Để tái tạo kết quả
+
+# Chia dữ liệu thành tập huấn luyện và kiểm tra (80% huấn luyện, 20% kiểm tra)
+train_index <- sample(seq_len(nrow(df_st_numeric)), size = 0.8 * nrow(df_st_numeric))
+train_data <- df_st_numeric[train_index, ]
+test_data <- df_st_numeric[-train_index, ]
+
+# Tạo công thức mô hình với các biến đã chọn
+st_formula_final <- as.formula(paste("wage ~", paste(st_best_vars, collapse = "+")))
+
+# Huấn luyện mô hình hồi quy tuyến tính
+st_model_final <- lm(st_formula_final, data = train_data)
+
+# Dự đoán trên tập kiểm tra
+st_predictions <- predict(st_model_final, newdata = test_data)
+
+# Tính toán RMSE trên tập kiểm tra
+actual_values <- test_data$wage
+rmse <- sqrt(mean((actual_values - st_predictions)^2))
+print(paste("RMSE từ tập kiểm tra: ", rmse))
+```
+
+
+#### R2 Score
+
+```{r}
+actual_values <- df_st_numeric$wage
+predicted_values <- st_predict_wage
+ss_res <- sum((actual_values - predicted_values)^2)
+ss_tot <- sum((actual_values - mean(actual_values))^2)
+r2 <- 1 - (ss_res / ss_tot)
+print(paste("R2 Score của mô hình là:", r2))
+```
+
+#### Áp dụng k-fold validation để tính RMSE
+
+```{r}
+# Áp dụng K-Fold CV với k = 5
+k <- 5
+k_fold_result <- k_fold_cv(df_st_numeric, st_formula_final, k)
+```
+
+```{r, echo=FALSE}
+# In kết quả
+print(paste("RMSE từ K-Fold CV (k =", k, "):", k_fold_result))
+```
+
+#### 3.2.7 Mở rộng mô hình
+
+##### Khởi tạo mô hình
+Ta sẽ tiến hành chạy mô hình bậc 2 với các biến có ít độ tuyến tính với mô hình
+
+```{r}
+coeffs <- summary(st_model_final)$coefficients
+
+if (is.matrix(coeffs)) {
+  p_values <- coeffs[, "Pr(>|t|)"]
+} else {
+  # Khi chỉ có một biến độc lập
+  p_values <- coeffs["Pr(>|t|)"]
+}
+
+# Loại bỏ hệ số intercept (nếu cần)
+p_values <- p_values[-1]  # Loại bỏ dòng đầu tiên (Intercept)
+
+# Phân loại biến theo p-value
+st_2 <- names(p_values[p_values > 0.05])  # Biến có p-value > 0.05
+st_1 <- names(p_values[p_values <= 0.05]) # Biến có p-value <= 0.05
+
+st_best_vars_1 <- st_best_vars[st_best_vars %in% st_1]  
+st_best_vars_2 <- st_best_vars[st_best_vars %in% st_2]
+# Tạo công thức mô hình bậc hai
+st_formula_final <- as.formula(paste(
+  "wage ~", 
+  paste(st_best_vars_1, collapse = "+"), 
+  "+", 
+  paste(paste0("I(", st_best_vars_2, "^2)"), collapse = "+")
+))
+
+# Chạy mô hình hồi quy tuyến tính bậc hai với các biến đã chọn
+st_model_final <- lm(st_formula_final, data = df_st_numeric)
+
+```
+
+```{r}
+# In kết quả của mô hình
+summary(st_model_final)
+```
+
+##### Đường thẳng hồi quy
+
+```{r, echo=FALSE}
+# Dự đoán với mô hình mới
+st_predict_wage <- predict(st_model_final, newdata = df_st_numeric)
+
+# Vẽ biểu đồ dự đoán so với giá trị thực tế
+result <- data.frame(actual_values = df_st_numeric$wage, predictions = st_predict_wage)
+
+ggplot(result, aes(x = actual_values, y = predictions)) +
+  geom_point(color = "red") +
+  geom_abline(slope = 1, intercept = 0, color = "blue") +
+  labs(
+    title = "Actual vs Predicted Values (Quadratic Model)",
+    x = "Actual Values",
+    y = "Predicted Values"
+  ) +
+  theme_minimal()
+```
+
+
+##### Đánh giá mô hình
+
+```{r, echo=FALSE}
+set.seed(5)  # Để tái tạo kết quả
+
+# Chia dữ liệu thành tập huấn luyện và kiểm tra (80% huấn luyện, 20% kiểm tra)
+train_index <- sample(seq_len(nrow(df_st_numeric)), size = 0.8 * nrow(df_st_numeric))
+train_data <- df_st_numeric[train_index, ]
+test_data <- df_st_numeric[-train_index, ]
+
+# Tạo công thức mô hình bậc hai
+st_formula_final <- as.formula(paste(
+  "wage ~", 
+  paste(st_best_vars, collapse = "+"), 
+  "+", 
+  paste(paste0("I(", st_best_vars, "^2)"), collapse = "+")
+))
+
+# Huấn luyện mô hình hồi quy bậc hai
+st_model_final <- lm(st_formula_final, data = train_data)
+
+# Dự đoán trên tập kiểm tra
+st_predictions <- predict(st_model_final, newdata = test_data)
+
+# Tính toán RMSE trên tập kiểm tra
+actual_values <- test_data$wage
+rmse <- sqrt(mean((actual_values - st_predictions)^2))
+print(paste("RMSE từ tập kiểm tra (Quadratic Model): ", rmse))
+```
+
+```{r, echo=FALSE}
+actual_values <- df_st_numeric$wage
+predicted_values <- st_predict_wage
+ss_res <- sum((actual_values - predicted_values)^2)
+ss_tot <- sum((actual_values - mean(actual_values))^2)
+r2 <- 1 - (ss_res / ss_tot)
+print(paste("R2 Score của mô hình bậc hai là:", r2))
+```
+
+**Nhận xét**: Mô hình bậc 2 có kết quả chạy tốt hơn, với R2 Score cao hơn và RMSE thấp hơn.
+
+### 3.3 Mô hình hồi quy dự đoán mức lương cho vị trí Tiền vệ
+
+#### 3.3.1 Lựa chọn biến phù hợp cho mô hình 
+
+```{r}
+df_mid_numeric <- df_mid_numeric |> select_if(is.numeric)
+
+# Tìm các biến phụ thuộc tuyến tính
+lin_combos <- findLinearCombos(df_mid_numeric)
+# Loại bỏ các biến phụ thuộc tuyến tính (nếu có)
+if (!is.null(lin_combos$remove)) {
+  df_mid_cleaned <- df_mid_numeric[, -lin_combos$remove]
+} else {
+  df_mid_cleaned <- df_mid_numeric
+}
+
+# Loại bỏ các biến không có ý nghĩa 
+df_mid_numeric <- df_mid_cleaned |> select(-c(id, nationality, club)) 
+
+```
+
+Dùng Stepwise để lựa chọn các biến phù hợp:
+
+```{r, results='hide'}
+# Chạy stepwise để giảm số lượng biến
+md_full <- lm(wage ~ ., data = df_mid_numeric)
+step_md <- step(md_full, direction = "both")
+
+# Lấy danh sách biến từ stepwise
+selected_vars <- names(coef(step_md))[-1]
+```
+
+Các biến phù hợp để khởi tạo mô hình là:
+
+```{r}
+print(selected_vars)
+```
+
+#### 3.3.2 Biểu đồ RMSE cho các biến đã chọn
+
+```{r, echo=FALSE, warning=FALSE}
+# Giới hạn dữ liệu chỉ chứa các biến đã chọn
+df_mid_numeric <- df_mid_numeric[, c("wage", selected_vars)]
+#view(df_mid_numeric)
+
+# thực hiện regsubsets để lấy tập biến con với RMSE nhỏ nhất
+mid_rmse_values <- c()
+mid_best_nvmax <- 0
+mid_min_rmse <- Inf  # Khởi tạo giá trị RMSE thấp nhất là vô cùng lớn
+mid_best_vars <- c()
+
+n_col <- ncol(df_mid_numeric) - 1
+
+# Lặp qua các giá trị nvmax từ 1 đến số lượng biến tối đa
+for (i in 1:n_col) {
+  # Thực hiện regsubsets với nvmax = i
+  mid_best_subset <- regsubsets(wage ~ ., data = df_mid_numeric, nvmax = i)
+  
+  # Lấy thông tin tóm tắt từ regsubsets
+  mid_best_subset_summary <- summary(mid_best_subset)
+  
+  # Tính toán giá trị dự đoán và RMSE cho tập con tốt nhất với i biến
+  mid_selected_vars <- names(coef(mid_best_subset, id = i))[-1]
+  mid_formula <- as.formula(paste("wage ~", paste(mid_selected_vars, collapse = "+")))
+  
+  # Chạy mô hình hồi quy tuyến tính
+  mid_model <- lm(mid_formula, data = df_mid_numeric)
+  
+  # Tính toán RMSE
+  mid_predictions <- predict(mid_model, newdata = df_mid_numeric)
+  mid_rmse <- sqrt(mean((df_mid_numeric$wage - mid_predictions)^2))
+  
+  # Lưu lại RMSE
+  mid_rmse_values <- c(mid_rmse_values, mid_rmse)
+  
+  # Kiểm tra nếu RMSE hiện tại nhỏ hơn RMSE nhỏ nhất
+  if (mid_rmse < mid_min_rmse) {
+    mid_min_rmse <- mid_rmse
+    mid_best_nvmax <- i
+    mid_best_vars <- mid_selected_vars  # Lưu lại các biến tương ứng với RMSE nhỏ nhất
+  }
+}
+
+# Tạo bảng dữ liệu cho ggplot
+mid_rmse_data <- data.frame(
+  nvmax = 1:n_col,
+  RMSE = mid_rmse_values
+)
+
+# Vẽ biểu đồ RMSE
+ggplot(mid_rmse_data, aes(x = nvmax, y = RMSE)) +
+  geom_line(color = "blue", size = 1) +
+  geom_point(color = "red", size = 2) +
+  labs(
+    x = "Number of Variables (nvmax)",
+    y = "RMSE",
+    title = "RMSE vs Number of Variables"
+  ) +
+  theme_minimal()
+```
+
+**Nhận xét**: Vậy, các biến trên được chọn để khởi tạo mô hình là phù hợp
+
+#### 3.3.3 Áp dụng mô hình cho các biến đã chọn
+
+```{r, echo=FALSE}
+# Tạo công thức hồi quy từ các biến trong mid_best_vars
+mid_formula_final <- as.formula(paste("wage ~", paste(mid_best_vars, collapse = "+")))
+
+# Chạy mô hình hồi quy tuyến tính với các biến đã chọn
+mid_model_final <- lm(mid_formula_final, data = df_mid_numeric)
+
+# In kết quả của mô hình
+summary(mid_model_final)
+```
+
+**Nhận xét**:
+
+- R2 Score: các biến giải thích không quá tốt cho biến mục tiêu
+
+- Một số biến ảnh hưởng mạnh đến wage của vị trí Tiền vệ: age, value, inter_repu, heading_accuracy, stamina.
+
+- Một số biến không ảnh hưởng nhiều đến mô hình: standing_tackle.
+
+#### 3.3.4 Biểu đồ hồi quy
+
+```{r}
+# Dự đoán với mô hình mới
+mid_predict_wage <- predict(mid_model_final, newdata = df_mid_numeric)
+
+# Vẽ biểu đồ dự đoán so với giá trị thực tế
+result <- data.frame(actual_values = df_mid_numeric$wage, predictions = mid_predict_wage)
+
+ggplot(result, aes(x = actual_values, y = predictions)) +
+  geom_point(color = "red") +
+  geom_abline(slope = 1, intercept = 0, color = "blue") +
+  labs(
+    title = "Actual vs Predicted Values",
+    x = "Actual Values",
+    y = "Predicted Values"
+  ) +
+  theme_minimal()
+```
+
+**Nhận xét**: Đường thẳng hồi quy không quá khớp với dữ liệu.
+
+#### 3.3.5 Một số chuẩn đoán cho mô hình
+
+##### Kiểm định tuyến tính mô hình
+
+```{r, echo=FALSE}
+ggplot(data = mid_model_final, mapping = aes(x = .fitted, y = .resid)) +
+  geom_point() +
+  geom_smooth(method = "loess", se = FALSE) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(title = "Residuals vs Fitted",
+       x = "Fitted values", 
+       y = "Residuals") +
+  theme_bw()
+```
+
+**Nhận xét**: Hình vẽ cho thấy xu hướng đường cong
+
+=> Giả định về tuyến tính của mô hình là chưa phù hợp
+
+##### Kiểm đinh đồng nhất phương sai
+
+```{r, echo=FALSE}
+ggplot(data = mid_model_final, mapping = aes(x = .fitted, y = sqrt(abs(.stdresid)))) +
+  geom_point(na.rm = TRUE) +
+  geom_smooth(method = "loess", se = FALSE, na.rm = TRUE) +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  labs(x = "Fitted Values", y = expression(sqrt("|Standardized residuals|"))) +
+  theme_bw()
+```
+
+**Nhận xét**: Đồ thị không xấp xỉ đường thẳng 1
+
+=> Giả định về phương sai đồng nhất là chưa hợp lý
+
+##### Kiểm tra đa cộng tuyến
+
+```{r}
+vif(mid_model_final)
+```
+
+**Nhận xét**: Mô hình không xảy ra đa cộng tuyến.
+
+#### 3.3.6 Đánh giá mô hình
+##### RMSE của mô hình
+
+```{r}
+# Đánh giá mô hình với tập kiểm tra
+set.seed(5)  # Để tái tạo kết quả
+
+# Chia dữ liệu thành tập huấn luyện và kiểm tra (80% huấn luyện, 20% kiểm tra)
+train_index <- sample(seq_len(nrow(df_mid_numeric)), size = 0.8 * nrow(df_mid_numeric))
+train_data <- df_mid_numeric[train_index, ]
+test_data <- df_mid_numeric[-train_index, ]
+
+# Tạo công thức mô hình với các biến đã chọn
+mid_formula_final <- as.formula(paste("wage ~", paste(mid_best_vars, collapse = "+")))
+
+# Huấn luyện mô hình hồi quy tuyến tính
+mid_model_final <- lm(mid_formula_final, data = train_data)
+
+# Dự đoán trên tập kiểm tra
+mid_predictions <- predict(mid_model_final, newdata = test_data)
+
+# Tính toán RMSE trên tập kiểm tra
+actual_values <- test_data$wage
+rmse <- sqrt(mean((actual_values - mid_predictions)^2))
+print(paste("RMSE từ tập kiểm tra: ", rmse))
+```
+
+
+##### R2 Score
+
+```{r}
+actual_values <- df_mid_numeric$wage
+predicted_values <- mid_predict_wage
+ss_res <- sum((actual_values - predicted_values)^2)
+ss_tot <- sum((actual_values - mean(actual_values))^2)
+r2 <- 1 - (ss_res / ss_tot)
+print(paste("R2 Score của mô hình là:", r2))
+```
+
+##### Áp dụng k-fold validation để tính RMSE
+
+```{r}
+# Áp dụng K-Fold CV với k = 5
+k <- 5
+k_fold_result <- k_fold_cv(df_mid_numeric, mid_formula_final, k)
+```
+
+```{r, echo=FALSE}
+# In kết quả
+print(paste("RMSE từ K-Fold CV (k =", k, "):", k_fold_result))
+```
+
+#### 3.3.7 Mở rộng mô hình
+
+##### Khởi tạo mô hình
+Ta sẽ tiến hành chạy mô hình bậc 2 với các biến có ít độ tuyến tính với mô hình
+
+```{r}
+coeffs <- summary(mid_model_final)$coefficients
+
+if (is.matrix(coeffs)) {
+  p_values <- coeffs[, "Pr(>|t|)"]
+} else {
+  # Khi chỉ có một biến độc lập
+  p_values <- coeffs["Pr(>|t|)"]
+}
+
+# Loại bỏ hệ số intercept (nếu cần)
+p_values <- p_values[-1]  # Loại bỏ dòng đầu tiên (Intercept)
+
+# Phân loại biến theo p-value
+mid_2 <- names(p_values[p_values > 0.05])  # Biến có p-value > 0.05
+mid_1 <- names(p_values[p_values <= 0.05]) # Biến có p-value <= 0.05
+
+mid_best_vars_1 <- mid_best_vars[mid_best_vars %in% mid_1]  
+mid_best_vars_2 <- mid_best_vars[mid_best_vars %in% mid_2]
+
+# Tạo công thức mô hình bậc hai với các biến đã chọn
+mid_formula_final <- as.formula(paste(
+  "wage ~", 
+  paste(mid_best_vars_1, collapse = "+"), 
+  "+", 
+  paste(paste0("I(", mid_best_vars_2, "^2)"), collapse = "+")
+))
+
+# Chạy mô hình hồi quy bậc hai với các biến đã chọn
+mid_model_final <- lm(mid_formula_final, data = df_mid_numeric)
+```
+
+```{r}
+# In kết quả của mô hình
+summary(mid_model_final)
+```
+
+##### Đường thẳng hồi quy
+
+```{r, echo=FALSE}
+# Dự đoán với mô hình mới
+mid_predict_wage <- predict(mid_model_final, newdata = df_mid_numeric)
+
+# Vẽ biểu đồ dự đoán so với giá trị thực tế
+result <- data.frame(actual_values = df_mid_numeric$wage, predictions = mid_predict_wage)
+
+ggplot(result, aes(x = actual_values, y = predictions)) +
+  geom_point(color = "red") +
+  geom_abline(slope = 1, intercept = 0, color = "blue") +
+  labs(
+    title = "Actual vs Predicted Values (Quadratic Model)",
+    x = "Actual Values",
+    y = "Predicted Values"
+  ) +
+  theme_minimal()
+```
+
+
+##### Đánh giá mô hình
+
+```{r, echo=FALSE}
+# Đánh giá mô hình với tập kiểm tra
+set.seed(5)  # Để tái tạo kết quả
+
+# Chia dữ liệu thành tập huấn luyện và kiểm tra (80% huấn luyện, 20% kiểm tra)
+train_index <- sample(seq_len(nrow(df_mid_numeric)), size = 0.8 * nrow(df_mid_numeric))
+train_data <- df_mid_numeric[train_index, ]
+test_data <- df_mid_numeric[-train_index, ]
+
+# Tạo công thức mô hình bậc hai
+mid_formula_final <- as.formula(paste(
+  "wage ~", 
+  paste(mid_best_vars, collapse = "+"), 
+  "+", 
+  paste(paste0("I(", mid_best_vars, "^2)"), collapse = "+")
+))
+
+# Huấn luyện mô hình hồi quy bậc hai
+mid_model_final <- lm(mid_formula_final, data = train_data)
+
+# Dự đoán trên tập kiểm tra
+mid_predictions <- predict(mid_model_final, newdata = test_data)
+
+# Tính toán RMSE trên tập kiểm tra
+actual_values <- test_data$wage
+rmse <- sqrt(mean((actual_values - mid_predictions)^2))
+print(paste("RMSE từ tập kiểm tra (Quadratic Model): ", rmse))
+```
+
+```{r, echo=FALSE}
+actual_values <- df_mid_numeric$wage
+predicted_values <- mid_predict_wage
+ss_res <- sum((actual_values - predicted_values)^2)
+ss_tot <- sum((actual_values - mean(actual_values))^2)
+r2 <- 1 - (ss_res / ss_tot)
+print(paste("R2 Score của mô hình bậc hai là:", r2))
+```
+
+**Nhận xét**: Mô hình bậc 2 có kết quả chạy tương đương.
+
+### 3.4 Mô hình hồi quy dự đoán mức lương cho vị trí Hậu vệ
+
+#### 3.4.1 Lựa chọn biến phù hợp cho mô hình 
+
+```{r}
+df_defender_numeric <- df_df_numeric |> select_if(is.numeric)
+
+# Tìm các biến phụ thuộc tuyến tính
+lin_combos <- findLinearCombos(df_defender_numeric)
+# Loại bỏ các biến phụ thuộc tuyến tính (nếu có)
+if (!is.null(lin_combos$remove)) {
+  df_defender_cleaned <- df_defender_numeric[, -lin_combos$remove]
+} else {
+  df_defender_cleaned <- df_defender_numeric
+}
+
+# Loại bỏ các biến không có ý nghĩa 
+df_defender_numeric <- df_defender_cleaned |> select(-c(id, nationality, club)) 
+ 
+
+```
+
+Dùng Stepwise để lựa chọn các biến phù hợp:
+
+```{r, results='hide'}
+# Chạy stepwise để giảm số lượng biến
+md_full <- lm(wage ~ ., data = df_defender_numeric)
+step_md <- step(md_full, direction = "both")
+
+# Lấy danh sách biến từ stepwise
+selected_vars <- names(coef(step_md))[-1]
+```
+
+Các biến phù hợp để khởi tạo mô hình là:
+
+```{r}
+print(selected_vars)
+```
+
+#### 3.4.2 Biểu đồ RMSE cho các biến đã chọn
+
+```{r, echo=FALSE, warning=FALSE}
+df_defender_numeric <- df_defender_numeric[, c("wage", selected_vars)]
+#view(df_defender_numeric)
+
+# thực hiện regsubsets để lấy tập biến con với RMSE nhỏ nhất
+defender_rmse_values <- c()
+defender_best_nvmax <- 0
+defender_min_rmse <- Inf  # Khởi tạo giá trị RMSE thấp nhất là vô cùng lớn
+defender_best_vars <- c()
+
+n_col <- ncol(df_defender_numeric) - 1
+
+# Lặp qua các giá trị nvmax từ 1 đến số lượng biến tối đa
+for (i in 1:n_col) {
+  # Thực hiện regsubsets với nvmax = i
+  defender_best_subset <- regsubsets(wage ~ ., data = df_defender_numeric, nvmax = i)
+  
+  # Lấy thông tin tóm tắt từ regsubsets
+  defender_best_subset_summary <- summary(defender_best_subset)
+  
+  # Tính toán giá trị dự đoán và RMSE cho tập con tốt nhất với i biến
+  defender_selected_vars <- names(coef(defender_best_subset, id = i))[-1]
+  defender_formula <- as.formula(paste("wage ~", paste(defender_selected_vars, collapse = "+")))
+  
+  # Chạy mô hình hồi quy tuyến tính
+  defender_model <- lm(defender_formula, data = df_defender_numeric)
+  
+  # Tính toán RMSE
+  defender_predictions <- predict(defender_model, newdata = df_defender_numeric)
+  defender_rmse <- sqrt(mean((df_defender_numeric$wage - defender_predictions)^2))
+  
+  # Lưu lại RMSE
+  defender_rmse_values <- c(defender_rmse_values, defender_rmse)
+  
+  # Kiểm tra nếu RMSE hiện tại nhỏ hơn RMSE nhỏ nhất
+  if (defender_rmse < defender_min_rmse) {
+    defender_min_rmse <- defender_rmse
+    defender_best_nvmax <- i
+    defender_best_vars <- defender_selected_vars  # Lưu lại các biến tương ứng với RMSE nhỏ nhất
+  }
+}
+
+# Tạo bảng dữ liệu cho ggplot
+defender_rmse_data <- data.frame(
+  nvmax = 1:n_col,
+  RMSE = defender_rmse_values
+)
+
+# Vẽ biểu đồ RMSE
+ggplot(defender_rmse_data, aes(x = nvmax, y = RMSE)) +
+  geom_line(color = "blue", size = 1) +
+  geom_point(color = "red", size = 2) +
+  labs(
+    x = "Number of Variables (nvmax)",
+    y = "RMSE",
+    title = "RMSE vs Number of Variables"
+  ) +
+  theme_minimal()
+```
+
+**Nhận xét**: Vậy, các biến trên được chọn để khởi tạo mô hình là phù hợp
+
+#### 3.4.3 Áp dụng mô hình cho các biến đã chọn
+
+```{r, echo=FALSE}
+set.seed(1)
+defender_formula_final <- as.formula(paste("wage ~", paste(defender_best_vars, collapse = "+")))
+
+# Chạy mô hình hồi quy tuyến tính với các biến đã chọn
+defender_model_final <- lm(defender_formula_final, data = df_defender_numeric)
+
+# In kết quả của mô hình
+summary(defender_model_final)
+```
+
+**Nhận xét**:
+
+- R2 Score: các biến giải thích không quá tốt cho biến mục tiêu.
+
+- Một số biến ảnh hưởng mạnh đến wage của vị trí Hậu vệ: age, value, inter_repu, skill_moves, stamina, sliding_tackle. 
+
+- Một số biến không ảnh hưởng nhiều đến mô hình: curve, jumping.
+
+#### 3.4.4 Biểu đồ hồi quy
+
+```{r}
+# Dự đoán với mô hình mới
+defender_predict_wage <- predict(defender_model_final, newdata = df_defender_numeric)
+
+# Vẽ biểu đồ dự đoán so với giá trị thực tế
+result <- data.frame(actual_values = df_defender_numeric$wage, predictions = defender_predict_wage)
+
+ggplot(result, aes(x = actual_values, y = predictions)) +
+  geom_point(color = "red") +
+  geom_abline(slope = 1, intercept = 0, color = "blue") +
+  labs(
+    title = "Actual vs Predicted Values",
+    x = "Actual Values",
+    y = "Predicted Values"
+  ) +
+  theme_minimal()
+```
+
+**Nhận xét**: Đường thẳng hồi quy không quá khớp với dữ liệu.
+
+#### 3.4.5 Một số chuẩn đoán cho mô hình
+
+##### Kiểm định tuyến tính mô hình
+
+```{r, echo=FALSE}
+ggplot(data = defender_model_final, mapping = aes(x = .fitted, y = .resid)) +
+  geom_point() +
+  geom_smooth(method = "loess", se = FALSE) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(title = "Residuals vs Fitted",
+       x = "Fitted values", 
+       y = "Residuals") +
+  theme_bw()
+```
+
+**Nhận xét**: Hình vẽ cho thấy xu hướng đường cong
+
+=> Giả định về tuyến tính của mô hình là chưa phù hợp
+
+##### Kiểm đinh đồng nhất phương sai
+
+```{r, echo=FALSE}
+ggplot(data = defender_model_final, mapping = aes(x = .fitted, y = sqrt(abs(.stdresid)))) +
+  geom_point(na.rm = TRUE) +
+  geom_smooth(method = "loess", se = FALSE, na.rm = TRUE) +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  labs(x = "Fitted Values", y = expression(sqrt("|Standardized residuals|"))) +
+  theme_bw()
+```
+
+**Nhận xét**: Đồ thị dường như không xấp xỉ đường thẳng 1
+
+=> Giả định về phương sai đồng nhất là chưa hợp lý
+
+##### Kiểm tra đa cộng tuyến
+
+```{r}
+vif(defender_model_final)
+```
+
+**Nhận xét**: Mô hình không xảy ra đa cộng tuyến.
+
+#### 3.4.6 Đánh giá mô hình
+##### RMSE của mô hình
+
+```{r}
+# Đánh giá mô hình với tập kiểm tra
+set.seed(5)  # Để tái tạo kết quả
+
+# Chia dữ liệu thành tập huấn luyện và kiểm tra (80% huấn luyện, 20% kiểm tra)
+train_index <- sample(seq_len(nrow(df_defender_numeric)), size = 0.8 * nrow(df_defender_numeric))
+train_data <- df_defender_numeric[train_index, ]
+test_data <- df_defender_numeric[-train_index, ]
+
+# Tạo công thức mô hình với các biến đã chọn
+defender_formula_final <- as.formula(paste("wage ~", paste(defender_best_vars, collapse = "+")))
+
+# Huấn luyện mô hình hồi quy tuyến tính
+defender_model_final <- lm(defender_formula_final, data = train_data)
+
+# Dự đoán trên tập kiểm tra
+defender_predictions <- predict(defender_model_final, newdata = test_data)
+
+# Tính toán RMSE trên tập kiểm tra
+actual_values <- test_data$wage
+rmse <- sqrt(mean((actual_values - defender_predictions)^2))
+print(paste("RMSE từ tập kiểm tra: ", rmse))
+```
+
+
+#### R2 Score
+
+```{r}
+ss_total <- sum((actual_values - mean(actual_values))^2)  # SS_tot
+ss_residual <- sum((actual_values - defender_predictions)^2)  # SS_res
+r_squared <- 1 - (ss_residual / ss_total)
+print(paste("R^2 từ tập kiểm tra: ", r_squared))
+```
+
+#### Áp dụng k-fold validation để tính RMSE
+
+```{r}
+# Áp dụng K-Fold CV với k = 5
+k <- 5
+k_fold_result <- k_fold_cv(df_defender_numeric, defender_formula_final, k)
+```
+
+```{r, echo=FALSE}
+# In kết quả
+print(paste("RMSE từ K-Fold CV (k =", k, "):", k_fold_result))
+```
+
+#### 3.4.7 Mở rộng mô hình
+
+##### Khởi tạo mô hình
+Ta sẽ tiến hành chạy mô hình bậc 2 với các biến có ít độ tuyến tính với mô hình
+
+```{r}
+coeffs <- summary(defender_model_final)$coefficients
+
+if (is.matrix(coeffs)) {
+  p_values <- coeffs[, "Pr(>|t|)"]
+} else {
+  # Khi chỉ có một biến độc lập
+  p_values <- coeffs["Pr(>|t|)"]
+}
+
+# Loại bỏ hệ số intercept (nếu cần)
+p_values <- p_values[-1]  # Loại bỏ dòng đầu tiên (Intercept)
+
+# Phân loại biến theo p-value
+defender_2 <- names(p_values[p_values > 0.05])  # Biến có p-value > 0.05
+defender_1 <- names(p_values[p_values <= 0.05]) # Biến có p-value <= 0.05
+
+defender_best_vars_1 <- defender_best_vars[defender_best_vars %in% defender_1]  
+defender_best_vars_2 <- defender_best_vars[defender_best_vars %in% defender_2]
+
+# Tạo công thức hồi quy bậc hai từ các biến trong defender_best_vars
+defender_formula_final <- as.formula(paste(
+  "wage ~", 
+  paste(defender_best_vars_1, collapse = "+"), 
+  "+", 
+  paste(paste0("I(", defender_best_vars_2, "^2)"), collapse = "+")
+))
+
+# Chạy mô hình hồi quy bậc hai với các biến đã chọn
+defender_model_final <- lm(defender_formula_final, data = df_defender_numeric)
+```
+
+```{r}
+# In kết quả của mô hình
+summary(defender_model_final)
+```
+
+##### Đường thẳng hồi quy
+
+```{r, echo=FALSE}
+# Dự đoán với mô hình mới
+defender_predict_wage <- predict(defender_model_final, newdata = df_defender_numeric)
+
+# Vẽ biểu đồ dự đoán so với giá trị thực tế
+result <- data.frame(actual_values = df_defender_numeric$wage, predictions = defender_predict_wage)
+
+ggplot(result, aes(x = actual_values, y = predictions)) +
+  geom_point(color = "red") +
+  geom_abline(slope = 1, intercept = 0, color = "blue") +
+  labs(
+    title = "Actual vs Predicted Values (Quadratic Model)",
+    x = "Actual Values",
+    y = "Predicted Values"
+  ) +
+  theme_minimal()
+```
+
+##### Đánh giá mô hình
+
+```{r, echo=FALSE}
+# Đánh giá mô hình với tập kiểm tra
+set.seed(5)  # Để tái tạo kết quả
+
+# Chia dữ liệu thành tập huấn luyện và kiểm tra (80% huấn luyện, 20% kiểm tra)
+train_index <- sample(seq_len(nrow(df_defender_numeric)), size = 0.8 * nrow(df_defender_numeric))
+train_data <- df_defender_numeric[train_index, ]
+test_data <- df_defender_numeric[-train_index, ]
+
+# Tạo công thức hồi quy bậc hai
+defender_formula_final <- as.formula(paste(
+  "wage ~", 
+  paste(defender_best_vars, collapse = "+"), 
+  "+", 
+  paste(paste0("I(", defender_best_vars, "^2)"), collapse = "+")
+))
+
+# Huấn luyện mô hình hồi quy bậc hai
+defender_model_final <- lm(defender_formula_final, data = train_data)
+
+# Dự đoán trên tập kiểm tra
+defender_predictions <- predict(defender_model_final, newdata = test_data)
+
+# Tính toán RMSE trên tập kiểm tra
+actual_values <- test_data$wage
+rmse <- sqrt(mean((actual_values - defender_predictions)^2))
+print(paste("RMSE từ tập kiểm tra (Quadratic Model): ", rmse))
+```
+
+```{r, echo=FALSE}
+# Tính chỉ số R^2
+ss_total <- sum((actual_values - mean(actual_values))^2)  # SS_tot
+ss_residual <- sum((actual_values - defender_predictions)^2)  # SS_res
+r_squared <- 1 - (ss_residual / ss_total)
+print(paste("R2 Score từ tập kiểm tra (Quadratic Model): ", r_squared))
+```
+
+**Nhận xét**: Mô hình bậc 2 có kết quả chạy tốt hơn, với R2 Score cao hơn và RMSE thấp hơn.
